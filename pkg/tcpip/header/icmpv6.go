@@ -139,26 +139,34 @@ type ICMPv6Code byte
 // ICMP codes used with Destination Unreachable (Type 1). As per RFC 4443
 // section 3.1.
 const (
-	ICMPv6NetworkUnreachable ICMPv6Code = 0
-	ICMPv6Prohibited         ICMPv6Code = 1
-	ICMPv6BeyondScope        ICMPv6Code = 2
-	ICMPv6AddressUnreachable ICMPv6Code = 3
-	ICMPv6PortUnreachable    ICMPv6Code = 4
-	ICMPv6Policy             ICMPv6Code = 5
-	ICMPv6RejectRoute        ICMPv6Code = 6
+	ICMPv6NetworkUnreachable ICMPv6Code = iota
+	ICMPv6Prohibited
+	ICMPv6BeyondScope
+	ICMPv6AddressUnreachable
+	ICMPv6PortUnreachable
+	ICMPv6Policy
+	ICMPv6RejectRoute
 )
 
 // ICMP codes used with Time Exceeded (Type 3). As per RFC 4443 section 3.3.
 const (
-	ICMPv6HopLimitExceeded  ICMPv6Code = 0
-	ICMPv6ReassemblyTimeout ICMPv6Code = 1
+	ICMPv6HopLimitExceeded ICMPv6Code = iota
+	ICMPv6ReassemblyTimeout
 )
 
 // ICMP codes used with Parameter Problem (Type 4). As per RFC 4443 section 3.4.
+// The following 3 error types correspond to the following ICMP Codes
+// of the Paramter Problem ICMP error message. The message to report this error
+// includes a pointer field.
+//
+//   Code           0 - Erroneous header field encountered
+//                  1 - Unrecognized Next Header type encountered
+//                  2 - Unrecognized IPv6 option encountered
+//
 const (
-	ICMPv6ErroneousHeader ICMPv6Code = 0
-	ICMPv6UnknownHeader   ICMPv6Code = 1
-	ICMPv6UnknownOption   ICMPv6Code = 2
+	ICMPv6ErroneousHeader ICMPv6Code = iota
+	ICMPv6UnknownHeader
+	ICMPv6UnknownOption
 )
 
 // ICMPv6UnusedCode is the code value used with ICMPv6 messages which don't use
@@ -177,7 +185,12 @@ func (b ICMPv6) Code() ICMPv6Code { return ICMPv6Code(b[1]) }
 // SetCode sets the ICMP code field.
 func (b ICMPv6) SetCode(c ICMPv6Code) { b[1] = byte(c) }
 
-// SetTypeSpecific sets the full 32 bit type specific data field.
+// TypeSpecific returns the 32 bit type specific data field.
+func (b ICMPv6) TypeSpecific() uint32 {
+	return binary.BigEndian.Uint32(b[icmpv6PointerOffset:])
+}
+
+// SetTypeSpecific sets the 32 bit type specific data field.
 func (b ICMPv6) SetTypeSpecific(val uint32) {
 	binary.BigEndian.PutUint32(b[icmpv6PointerOffset:], val)
 }

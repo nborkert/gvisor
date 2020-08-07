@@ -148,7 +148,16 @@ func (b ipv6OptionsExtHdr) Iter() IPv6OptionsExtHdrOptionsIterator {
 // modify the backing payload so long as the IPv6OptionsExtHdrOptionsIterator
 // obtained before modification is no longer used.
 type IPv6OptionsExtHdrOptionsIterator struct {
-	reader bytes.Reader
+	reader           bytes.Reader
+	optionOffset     int
+	nextOptionOffset int
+	parseOffset      int
+}
+
+// OptionParseOffset returns the distance we have progressed into the set of
+// options during parsing.
+func (i *IPv6OptionsExtHdrOptionsIterator) OptionParseOffset() uint32 {
+	return uint32(i.optionOffset + i.parseOffset)
 }
 
 // IPv6OptionUnknownAction is the action that must be taken if the processing
@@ -226,6 +235,8 @@ func (*IPv6UnknownExtHdrOption) isIPv6ExtHdrOption() {}
 // the options data, or an error occured.
 func (i *IPv6OptionsExtHdrOptionsIterator) Next() (IPv6ExtHdrOption, bool, error) {
 	for {
+		i.optionOffset = i.nextOptionOffset
+		i.parseOffset = 0
 		temp, err := i.reader.ReadByte()
 		if err != nil {
 			// If we can't read the first byte of a new option, then we know the
@@ -238,8 +249,10 @@ func (i *IPv6OptionsExtHdrOptionsIterator) Next() (IPv6ExtHdrOption, bool, error
 		// know the option does not have Length and Data fields. End processing of
 		// the Pad1 option and continue processing the buffer as a new option.
 		if id == ipv6Pad1ExtHdrOptionIdentifier {
+			i.nextOptionOffset = i.optionOffset + 1
 			continue
 		}
+		i.parseOffset++
 
 		length, err := i.reader.ReadByte()
 		if err != nil {
@@ -253,6 +266,7 @@ func (i *IPv6OptionsExtHdrOptionsIterator) Next() (IPv6ExtHdrOption, bool, error
 			// bytes for the whole option.
 			return nil, true, fmt.Errorf("error when reading the option's Length field for option with id = %d: %w", id, io.ErrUnexpectedEOF)
 		}
+		i.nextOptionOffset = i.optionOffset + int(length)
 
 		// Special-case the variable length padding option to avoid a copy.
 		if id == ipv6PadNExtHdrOptionIdentifier {
@@ -288,6 +302,8 @@ func (i *IPv6OptionsExtHdrOptionsIterator) Next() (IPv6ExtHdrOption, bool, error
 			return nil, true, fmt.Errorf("read %d out of %d option data bytes for option with id = %d: %w", n, length, id, err)
 		}
 
+		// finally got past the length byte
+		i.parseOffset++
 		return &IPv6UnknownExtHdrOption{Identifier: id, Data: bytes}, false, nil
 	}
 }
@@ -382,6 +398,35 @@ type IPv6PayloadIterator struct {
 	// Indicates to the iterator that it should return the remaining payload as a
 	// raw payload on the next call to Next.
 	forceRaw bool
+
+	// headerOffset is the offset  of the beginning of the current extension
+	// header starting from the beginning of the fixed header.
+	headerOffset uint32
+
+	// parseOffset is the byte offset into the current extension header of the
+	// field we are currently examining. It can be added to the header offset
+	// if the absolute offset within the packet is required.
+	parseOffset uint32
+
+	// nextOffset is the offset of the next header.
+	nextOffset uint32
+}
+
+// HeaderOffset returns the offset within the packet of the extension header
+// currently being processed.
+func (i IPv6PayloadIterator) HeaderOffset() uint32 {
+	return i.headerOffset
+}
+
+// IncrementParserOffset increments the Parser offset by the given amount.
+func (i IPv6PayloadIterator) IncrementParserOffset(inc int) {
+	i.parseOffset += uint32(inc)
+}
+
+// ParseOffset returns the offset of the field currently being examined within
+// its containing extension header.
+func (i IPv6PayloadIterator) ParseOffset() uint32 {
+	return i.parseOffset
 }
 
 // MakeIPv6PayloadIterator returns an iterator over the IPv6 payload containing
@@ -397,7 +442,8 @@ func MakeIPv6PayloadIterator(nextHdrIdentifier IPv6ExtensionHeaderIdentifier, pa
 		nextHdrIdentifier: nextHdrIdentifier,
 		payload:           payload.Clone(nil),
 		// We need a buffer of size 1 for calls to bufio.Reader.ReadByte.
-		reader: *bufio.NewReaderSize(io.MultiReader(readerPs...), 1),
+		reader:     *bufio.NewReaderSize(io.MultiReader(readerPs...), 1),
+		nextOffset: IPv6FixedHeaderSize,
 	}
 }
 
@@ -437,6 +483,8 @@ func (i *IPv6PayloadIterator) Next() (IPv6PayloadHeader, bool, error) {
 	// We could be forced to return i as a raw header when the previous header was
 	// a fragment extension header as the data following the fragment extension
 	// header may not be complete.
+	i.headerOffset = i.nextOffset
+	i.parseOffset = 0
 	if i.forceRaw {
 		return i.AsRawHeader(true /* consume */), false, nil
 	}
@@ -461,7 +509,7 @@ func (i *IPv6PayloadIterator) Next() (IPv6PayloadHeader, bool, error) {
 		return IPv6RoutingExtHdr(bytes), false, nil
 	case IPv6FragmentExtHdrIdentifier:
 		var data [6]byte
-		// We ignore the returned bytes becauase we know the fragment extension
+		// We ignore the returned bytes because we know the fragment extension
 		// header specific data will fit in data.
 		nextHdrIdentifier, _, err := i.nextHeaderData(true /* fragmentHdr */, data[:])
 		if err != nil {
@@ -515,6 +563,7 @@ func (i *IPv6PayloadIterator) nextHeaderData(fragmentHdr bool, bytes []byte) (IP
 	// would return io.EOF to indicate that io.Reader has reached the end of the
 	// payload.
 	nextHdrIdentifier, err := i.reader.ReadByte()
+	i.parseOffset++
 	i.payload.TrimFront(1)
 	if err != nil {
 		return 0, nil, fmt.Errorf("error when reading the Next Header field for extension header with id = %d: %w", i.nextHdrIdentifier, err)
@@ -523,6 +572,11 @@ func (i *IPv6PayloadIterator) nextHeaderData(fragmentHdr bool, bytes []byte) (IP
 	var length uint8
 	length, err = i.reader.ReadByte()
 	i.payload.TrimFront(1)
+	i.parseOffset++
+	// length is in 8 byte chunks but doesn't include the first 8 bytes.
+	// See RFC 8200 for each header type, sections 4.3-4.6 and the requirment
+	// in section 4.8 for new extension headers at the top of page 28.
+	i.nextOffset += uint32((length + 1) * ipv6ExtHdrLenBytesPerUnit)
 	if err != nil {
 		if fragmentHdr {
 			return 0, nil, fmt.Errorf("error when reading the Length field for extension header with id = %d: %w", i.nextHdrIdentifier, err)

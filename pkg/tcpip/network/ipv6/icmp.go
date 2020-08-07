@@ -15,6 +15,8 @@
 package ipv6
 
 import (
+	"fmt"
+
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -686,6 +688,29 @@ type icmpReason interface {
 	isICMPReason()
 }
 
+const ()
+
+// icmpReasonParameterProblem is an error during processing of extension headers
+// or the fixed header.
+// ICMP codes used with Parameter Problem (Type 4). As per RFC 4443 section 3.4.
+// The message to report this error includes a pointer field.
+//
+//   Pointer        Identifies the octet offset within the
+//                  invoking packet where the error was detected.
+//
+//                  The pointer will point beyond the end of the ICMPv6
+//                  packet if the field in error is beyond what can fit
+//                  in the maximum size of an ICMPv6 error message.
+type icmpReasonParameterProblem struct {
+	// What type of error it was.
+	code header.ICMPv6Code
+
+	// Where the error was found as an offset into the packet.
+	pointer uint32
+}
+
+func (*icmpReasonParameterProblem) isICMPReason() {}
+
 // icmpReasonPortUnreachable is an error where the transport protocol has no
 // listener and no alternative means to inform the sender.
 type icmpReasonPortUnreachable struct{}
@@ -776,10 +801,21 @@ func returnError(r *stack.Route, reason icmpReason, pkt *stack.PacketBuffer) *tc
 	newPkt.TransportProtocolNumber = header.ICMPv6ProtocolNumber
 
 	icmpHdr := header.ICMPv6(newPkt.TransportHeader().Push(header.ICMPv6DstUnreachableMinimumSize))
-	icmpHdr.SetCode(header.ICMPv6PortUnreachable)
-	icmpHdr.SetType(header.ICMPv6DstUnreachable)
+	var counter *tcpip.StatCounter
+	switch reason := reason.(type) {
+	case *icmpReasonParameterProblem:
+		icmpHdr.SetType(header.ICMPv6ParamProblem)
+		icmpHdr.SetCode(reason.code)
+		icmpHdr.SetTypeSpecific(reason.pointer)
+		counter = sent.ParamProblem
+	case *icmpReasonPortUnreachable:
+		icmpHdr.SetType(header.ICMPv6DstUnreachable)
+		icmpHdr.SetCode(header.ICMPv6PortUnreachable)
+		counter = sent.DstUnreachable
+	default:
+		panic(fmt.Sprintf("unsupported ICMP type %T", reason))
+	}
 	icmpHdr.SetChecksum(header.ICMPv6Checksum(icmpHdr, r.LocalAddress, r.RemoteAddress, newPkt.Data))
-	counter := sent.DstUnreachable
 	err := r.WritePacket(nil /* gso */, stack.NetworkHeaderParams{Protocol: header.ICMPv6ProtocolNumber, TTL: r.DefaultTTL(), TOS: stack.DefaultTOS}, newPkt)
 	if err != nil {
 		sent.Dropped.Increment()
