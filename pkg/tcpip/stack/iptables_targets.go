@@ -21,7 +21,17 @@ import (
 )
 
 // AcceptTarget accepts packets.
-type AcceptTarget struct{}
+type AcceptTarget struct {
+	// NetworkProtocol is the network protocol the target is used with.
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
+
+// ID implements Target.ID.
+func (at *AcceptTarget) ID() TargetID {
+	return TargetID{
+		NetworkProtocol: at.NetworkProtocol,
+	}
+}
 
 // Action implements Target.Action.
 func (AcceptTarget) Action(*PacketBuffer, *ConnTrack, Hook, *GSO, *Route, tcpip.Address) (RuleVerdict, int) {
@@ -29,16 +39,41 @@ func (AcceptTarget) Action(*PacketBuffer, *ConnTrack, Hook, *GSO, *Route, tcpip.
 }
 
 // DropTarget drops packets.
-type DropTarget struct{}
+type DropTarget struct {
+	// NetworkProtocol is the network protocol the target is used with.
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
+
+// ID implements Target.ID.
+func (dt *DropTarget) ID() TargetID {
+	return TargetID{
+		NetworkProtocol: dt.NetworkProtocol,
+	}
+}
 
 // Action implements Target.Action.
 func (DropTarget) Action(*PacketBuffer, *ConnTrack, Hook, *GSO, *Route, tcpip.Address) (RuleVerdict, int) {
 	return RuleDrop, 0
 }
 
+// ErrorTargetName is used to mark targets as error targets. Error targets
+// shouldn't be reached - an error has occurred if we fall through to one.
+const ErrorTargetName = "ERROR"
+
 // ErrorTarget logs an error and drops the packet. It represents a target that
 // should be unreachable.
-type ErrorTarget struct{}
+type ErrorTarget struct {
+	// NetworkProtocol is the network protocol the target is used with.
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
+
+// ID implements Target.ID.
+func (et *ErrorTarget) ID() TargetID {
+	return TargetID{
+		Name:            ErrorTargetName,
+		NetworkProtocol: et.NetworkProtocol,
+	}
+}
 
 // Action implements Target.Action.
 func (ErrorTarget) Action(*PacketBuffer, *ConnTrack, Hook, *GSO, *Route, tcpip.Address) (RuleVerdict, int) {
@@ -48,7 +83,19 @@ func (ErrorTarget) Action(*PacketBuffer, *ConnTrack, Hook, *GSO, *Route, tcpip.A
 
 // UserChainTarget marks a rule as the beginning of a user chain.
 type UserChainTarget struct {
+	// Name is the chain name.
 	Name string
+
+	// NetworkProtocol is the network protocol the target is used with.
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
+
+// ID implements Target.ID.
+func (uc *UserChainTarget) ID() TargetID {
+	return TargetID{
+		Name:            ErrorTargetName,
+		NetworkProtocol: uc.NetworkProtocol,
+	}
 }
 
 // Action implements Target.Action.
@@ -58,16 +105,29 @@ func (UserChainTarget) Action(*PacketBuffer, *ConnTrack, Hook, *GSO, *Route, tcp
 
 // ReturnTarget returns from the current chain. If the chain is a built-in, the
 // hook's underflow should be called.
-type ReturnTarget struct{}
+type ReturnTarget struct {
+	// NetworkProtocol is the network protocol the target is used with.
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
+
+// ID implements Target.ID.
+func (rt *ReturnTarget) ID() TargetID {
+	return TargetID{
+		NetworkProtocol: rt.NetworkProtocol,
+	}
+}
 
 // Action implements Target.Action.
 func (ReturnTarget) Action(*PacketBuffer, *ConnTrack, Hook, *GSO, *Route, tcpip.Address) (RuleVerdict, int) {
 	return RuleReturn, 0
 }
 
+// RedirectTargetName is used to mark targets as redirect targets. Redirect
+// targets should be reached for only NAT and Mangle tables. These targets will
+// change the destination port/destination IP for packets.
+const RedirectTargetName = "REDIRECT"
+
 // RedirectTarget redirects the packet by modifying the destination port/IP.
-// Min and Max values for IP and Ports in the struct indicate the range of
-// values which can be used to redirect.
 type RedirectTarget struct {
 	// TODO(gvisor.dev/issue/170): Other flags need to be added after
 	// we support them.
@@ -75,17 +135,22 @@ type RedirectTarget struct {
 	// redirect.
 	RangeProtoSpecified bool
 
-	// MinIP indicates address used to redirect.
-	MinIP tcpip.Address
+	// Addr indicates address used to redirect.
+	Addr tcpip.Address
 
-	// MaxIP indicates address used to redirect.
-	MaxIP tcpip.Address
+	// Port indicates port used to redirect.
+	Port uint16
 
-	// MinPort indicates port used to redirect.
-	MinPort uint16
+	// NetworkProtocol is the network protocol the target is used with.
+	NetworkProtocol tcpip.NetworkProtocolNumber
+}
 
-	// MaxPort indicates port used to redirect.
-	MaxPort uint16
+// ID implements Target.ID.
+func (rt *RedirectTarget) ID() TargetID {
+	return TargetID{
+		Name:            RedirectTargetName,
+		NetworkProtocol: rt.NetworkProtocol,
+	}
 }
 
 // Action implements Target.Action.
@@ -107,11 +172,9 @@ func (rt RedirectTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, gso
 	// to primary address of the incoming interface in Prerouting.
 	switch hook {
 	case Output:
-		rt.MinIP = tcpip.Address([]byte{127, 0, 0, 1})
-		rt.MaxIP = tcpip.Address([]byte{127, 0, 0, 1})
+		rt.Addr = tcpip.Address([]byte{127, 0, 0, 1})
 	case Prerouting:
-		rt.MinIP = address
-		rt.MaxIP = address
+		rt.Addr = address
 	default:
 		panic("redirect target is supported only on output and prerouting hooks")
 	}
@@ -122,7 +185,7 @@ func (rt RedirectTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, gso
 	switch protocol := netHeader.TransportProtocol(); protocol {
 	case header.UDPProtocolNumber:
 		udpHeader := header.UDP(pkt.TransportHeader().View())
-		udpHeader.SetDestinationPort(rt.MinPort)
+		udpHeader.SetDestinationPort(rt.Port)
 
 		// Calculate UDP checksum and set it.
 		if hook == Output {
@@ -140,7 +203,7 @@ func (rt RedirectTarget) Action(pkt *PacketBuffer, ct *ConnTrack, hook Hook, gso
 			}
 		}
 		// Change destination address.
-		netHeader.SetDestinationAddress(rt.MinIP)
+		netHeader.SetDestinationAddress(rt.Addr)
 		netHeader.SetChecksum(0)
 		netHeader.SetChecksum(^netHeader.CalculateChecksum())
 		pkt.NatDone = true
