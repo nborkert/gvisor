@@ -75,6 +75,11 @@ func (ri *replicaInode) Valid(context.Context) bool {
 	return ok
 }
 
+// Keep implements kernfs.inodeDynamicLookup.Keep.
+func (*replicaInode) Keep() bool {
+	return false
+}
+
 // Stat implements kernfs.Inode.Stat.
 func (ri *replicaInode) Stat(ctx context.Context, vfsfs *vfs.Filesystem, opts vfs.StatOptions) (linux.Statx, error) {
 	statx, err := ri.InodeAttrs.Stat(ctx, vfsfs, opts)

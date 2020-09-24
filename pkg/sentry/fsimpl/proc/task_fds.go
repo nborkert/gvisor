@@ -130,7 +130,7 @@ func (fs *filesystem) newFDDirInode(task *kernel.Task) *kernfs.Dentry {
 	inode.EnableLeakCheck()
 
 	dentry := &kernfs.Dentry{}
-	dentry.Init(inode)
+	dentry.Init(inode, fs.VFSFilesystem())
 	inode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 
 	return dentry
@@ -210,7 +210,7 @@ func (fs *filesystem) newFDSymlink(task *kernel.Task, fd int32, ino uint64) *ker
 	inode.Init(task.Credentials(), linux.UNNAMED_MAJOR, fs.devMinor, ino, linux.ModeSymlink|0777)
 
 	d := &kernfs.Dentry{}
-	d.Init(inode)
+	d.Init(inode, fs.VFSFilesystem())
 	return d
 }
 
@@ -234,6 +234,16 @@ func (s *fdSymlink) Getlink(ctx context.Context, mnt *vfs.Mount) (vfs.VirtualDen
 	vd := file.VirtualDentry()
 	vd.IncRef()
 	return vd, "", nil
+}
+
+// Valid implements kernfs.Inode.Valid.
+func (s *fdSymlink) Valid(ctx context.Context) bool {
+	return taskFDExists(ctx, s.task, s.fd)
+}
+
+// Keep implements kernfs.Inode.Keep.
+func (s *fdSymlink) Keep() bool {
+	return false
 }
 
 // fdInfoDirInode represents the inode for /proc/[pid]/fdinfo directory.
@@ -263,7 +273,7 @@ func (fs *filesystem) newFDInfoDirInode(task *kernel.Task) *kernfs.Dentry {
 	inode.EnableLeakCheck()
 
 	dentry := &kernfs.Dentry{}
-	dentry.Init(inode)
+	dentry.Init(inode, fs.VFSFilesystem())
 	inode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 
 	return dentry
@@ -327,4 +337,14 @@ func (d *fdInfoData) Generate(ctx context.Context, buf *bytes.Buffer) error {
 	flags := uint(file.StatusFlags()) | descriptorFlags.ToLinuxFileFlags()
 	fmt.Fprintf(buf, "flags:\t0%o\n", flags)
 	return nil
+}
+
+// Valid implements kernfs.Inode.Valid.
+func (d *fdInfoData) Valid(ctx context.Context) bool {
+	return taskFDExists(ctx, d.task, d.fd)
+}
+
+// Keep implements kernfs.Inode.Keep.
+func (d *fdInfoData) Keep() bool {
+	return false
 }

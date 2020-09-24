@@ -44,10 +44,10 @@
 // Lock ordering:
 //
 // kernfs.Filesystem.mu
-//   kernfs.Dentry.dirMu
-//     vfs.VirtualFilesystem.mountMu
-//       vfs.Dentry.mu
 //   kernfs.Filesystem.droppedDentriesMu
+//     kernfs.Dentry.dirMu
+//       vfs.VirtualFilesystem.mountMu
+//         vfs.Dentry.mu
 //   (inode implementation locks, if any)
 package kernfs
 
@@ -95,7 +95,7 @@ type Filesystem struct {
 	// example:
 	//
 	//   fs.mu.RLock()
-	//   fs.mu.processDeferredDecRefs()
+	//   defer fs.mu.processDeferredDecRefs()
 	//   defer fs.mu.RUnlock()
 	//   ...
 	//   fs.deferDecRef(dentry)
@@ -169,6 +169,9 @@ type Dentry struct {
 
 	vfsd vfs.Dentry
 
+	// fs is the owning filesystem. fs is immutable.
+	fs *vfs.Filesystem
+
 	// flags caches useful information about the dentry from the inode. See the
 	// dflags* consts above. Must be accessed by atomic ops.
 	flags uint32
@@ -188,8 +191,9 @@ type Dentry struct {
 // Precondition: Caller must hold a reference on inode.
 //
 // Postcondition: Caller's reference on inode is transferred to the dentry.
-func (d *Dentry) Init(inode Inode) {
+func (d *Dentry) Init(inode Inode, fs *vfs.Filesystem) {
 	d.vfsd.Init(d)
+	d.fs = fs
 	d.inode = inode
 	ftype := inode.Mode().FileType()
 	if ftype == linux.ModeDirectory {
@@ -217,13 +221,23 @@ func (d *Dentry) isSymlink() bool {
 }
 
 // DecRef implements vfs.DentryImpl.DecRef.
+//
+// Precondition: fs.mu must be locked for writing.
 func (d *Dentry) DecRef(ctx context.Context) {
 	// Before the destructor is called, Dentry must be removed from VFS' dentry cache.
 	d.DentryRefs.DecRef(func() {
 		d.inode.DecRef(ctx) // IncRef from Init.
 		d.inode = nil
 		if d.parent != nil {
-			d.parent.DecRef(ctx) // IncRef from Dentry.InsertChild.
+			d.parent.dirMu.Lock()
+			// Remove d from parent.children if it was not already removed
+			// during revalidation.
+			if _, ok := d.parent.children[d.name]; ok {
+				delete(d.parent.children, d.name)
+				d.parent.DecRef(ctx) // IncRef from Dentry.InsertChild.
+				d.fs.VirtualFilesystem().InvalidateDentry(ctx, d.VFSDentry())
+			}
+			d.parent.dirMu.Unlock()
 		}
 	})
 }
@@ -276,18 +290,22 @@ func (d *Dentry) InsertChildLocked(name string, child *Dentry) {
 // directory inode or modify the inode to be unlinked. So calling this on its own
 // isn't sufficient to remove a child from a directory.
 //
-// Precondition: d must represent a directory inode.
-func (d *Dentry) RemoveChild(name string, child *Dentry) error {
+// Preconditions:
+//  * fs.mu must be locked for writing.
+//  * d must represent a directory inode.
+func (d *Dentry) RemoveChild(ctx context.Context, name string, child *Dentry) error {
 	d.dirMu.Lock()
 	defer d.dirMu.Unlock()
-	return d.RemoveChildLocked(name, child)
+	return d.RemoveChildLocked(ctx, name, child)
 }
 
 // RemoveChildLocked is equivalent to RemoveChild, with additional
 // preconditions.
 //
-// Precondition: d.dirMu must be locked.
-func (d *Dentry) RemoveChildLocked(name string, child *Dentry) error {
+// Preconditions:
+//  * fs.mu must be locked for writing.
+//  * d.dirMu must be locked.
+func (d *Dentry) RemoveChildLocked(ctx context.Context, name string, child *Dentry) error {
 	if !d.isDir() {
 		panic(fmt.Sprintf("RemoveChild called on non-directory Dentry: %+v.", d))
 	}
@@ -299,6 +317,7 @@ func (d *Dentry) RemoveChildLocked(name string, child *Dentry) error {
 		panic(fmt.Sprintf("Dentry hashed into inode doesn't match what vfs thinks! Child: %+v, vfs: %+v", c, child))
 	}
 	delete(d.children, name)
+	d.DecRef(ctx) // IncRef from Dentry.InsertChild.
 	return nil
 }
 
@@ -447,9 +466,7 @@ type inodeDynamicLookup interface {
 	// contains a static set of children, the implementer can unconditionally
 	// return an appropriate error (ENOTDIR and ENOENT respectively).
 	//
-	// The child returned by Lookup will be hashed into the VFS dentry tree. Its
-	// lifetime can be controlled by the filesystem implementation with an
-	// appropriate implementation of Valid.
+	// The child returned by Lookup will be hashed into the VFS dentry tree.
 	//
 	// Lookup returns the child with an extra reference and the caller owns this
 	// reference.
@@ -458,6 +475,12 @@ type inodeDynamicLookup interface {
 	// Valid should return true if this inode is still valid, or needs to
 	// be resolved again by a call to Lookup.
 	Valid(ctx context.Context) bool
+
+	// Keep should return true if the reference taken on the dentry pointing to
+	// this inode should be kept after Lookup(). If true, the reference will
+	// not be released by kernfs. If false, then the reference returned from
+	// Lookup will be defer-dropped (see fs.deferDecRef()).
+	Keep() bool
 
 	// IterDirents is used to iterate over dynamically created entries. It invokes
 	// cb on each entry in the directory represented by the Inode.

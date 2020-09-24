@@ -88,6 +88,7 @@ func (InodeDirectoryNoNewChildren) NewNode(context.Context, string, vfs.MknodOpt
 //
 // +stateify savable
 type InodeNotDirectory struct {
+	AlwaysValid
 }
 
 // HasChildren implements Inode.HasChildren.
@@ -145,11 +146,6 @@ func (InodeNotDirectory) IterDirents(ctx context.Context, callback vfs.IterDiren
 	panic("IterDirents called on non-directory inode")
 }
 
-// Valid implements Inode.Valid.
-func (InodeNotDirectory) Valid(context.Context) bool {
-	return true
-}
-
 // InodeNoDynamicLookup partially implements the Inode interface, specifically
 // the inodeDynamicLookup sub interface. Directory inodes that do not support
 // dymanic entries (i.e. entries that are not "hashed" into the
@@ -157,7 +153,9 @@ func (InodeNotDirectory) Valid(context.Context) bool {
 // functions related to dynamic entries.
 //
 // +stateify savable
-type InodeNoDynamicLookup struct{}
+type InodeNoDynamicLookup struct {
+	AlwaysValid
+}
 
 // Lookup implements Inode.Lookup.
 func (InodeNoDynamicLookup) Lookup(ctx context.Context, name string) (*Dentry, error) {
@@ -167,11 +165,6 @@ func (InodeNoDynamicLookup) Lookup(ctx context.Context, name string) (*Dentry, e
 // IterDirents implements Inode.IterDirents.
 func (InodeNoDynamicLookup) IterDirents(ctx context.Context, callback vfs.IterDirentsCallback, offset, relOffset int64) (int64, error) {
 	return offset, nil
-}
-
-// Valid implements Inode.Valid.
-func (InodeNoDynamicLookup) Valid(ctx context.Context) bool {
-	return true
 }
 
 // InodeNotSymlink partially implements the Inode interface, specifically the
@@ -273,7 +266,7 @@ func (a *InodeAttrs) SetStat(ctx context.Context, fs *vfs.Filesystem, creds *aut
 
 // SetInodeStat sets the corresponding attributes from opts to InodeAttrs.
 // This function can be used by other kernfs-based filesystem implementation to
-// sets the unexported attributes into kernfs.InodeAttrs.
+// sets the unexported attributes into InodeAttrs.
 func (a *InodeAttrs) SetInodeStat(ctx context.Context, fs *vfs.Filesystem, creds *auth.Credentials, opts vfs.SetStatOptions) error {
 	if opts.Stat.Mask == 0 {
 		return nil
@@ -591,13 +584,13 @@ type StaticDirectory struct {
 var _ Inode = (*StaticDirectory)(nil)
 
 // NewStaticDir creates a new static directory and returns its dentry.
-func NewStaticDir(creds *auth.Credentials, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry, fdOpts GenericDirectoryFDOptions) *Dentry {
+func NewStaticDir(creds *auth.Credentials, fs *vfs.Filesystem, devMajor, devMinor uint32, ino uint64, perm linux.FileMode, children map[string]*Dentry, fdOpts GenericDirectoryFDOptions) *Dentry {
 	inode := &StaticDirectory{}
 	inode.Init(creds, devMajor, devMinor, ino, perm, fdOpts)
 	inode.EnableLeakCheck()
 
 	dentry := &Dentry{}
-	dentry.Init(inode)
+	dentry.Init(inode, fs)
 
 	inode.OrderedChildren.Init(OrderedChildrenOptions{})
 	links := inode.OrderedChildren.Populate(dentry, children)
@@ -615,7 +608,7 @@ func (s *StaticDirectory) Init(creds *auth.Credentials, devMajor, devMinor uint3
 	s.InodeAttrs.Init(creds, devMajor, devMinor, ino, linux.ModeDirectory|perm)
 }
 
-// Open implements kernfs.Inode.Open.
+// Open implements Inode.Open.
 func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, d *Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
 	fd, err := NewGenericDirectoryFD(rp.Mount(), d, &s.OrderedChildren, &s.locks, &opts, s.fdOpts)
 	if err != nil {
@@ -624,22 +617,22 @@ func (s *StaticDirectory) Open(ctx context.Context, rp *vfs.ResolvingPath, d *De
 	return fd.VFSFileDescription(), nil
 }
 
-// SetStat implements kernfs.Inode.SetStat not allowing inode attributes to be changed.
+// SetStat implements Inode.SetStat not allowing inode attributes to be changed.
 func (*StaticDirectory) SetStat(context.Context, *vfs.Filesystem, *auth.Credentials, vfs.SetStatOptions) error {
 	return syserror.EPERM
 }
 
-// DecRef implements kernfs.Inode.DecRef.
+// DecRef implements Inode.DecRef.
 func (s *StaticDirectory) DecRef(context.Context) {
 	s.StaticDirectoryRefs.DecRef(s.Destroy)
 }
 
-// AlwaysValid partially implements kernfs.inodeDynamicLookup.
+// AlwaysValid partially implements inodeDynamicLookup.
 //
 // +stateify savable
 type AlwaysValid struct{}
 
-// Valid implements kernfs.inodeDynamicLookup.Valid.
+// Valid implements inodeDynamicLookup.Valid.
 func (*AlwaysValid) Valid(context.Context) bool {
 	return true
 }

@@ -53,7 +53,7 @@ var _ kernfs.Inode = (*masterInode)(nil)
 
 // Open implements kernfs.Inode.Open.
 func (mi *masterInode) Open(ctx context.Context, rp *vfs.ResolvingPath, d *kernfs.Dentry, opts vfs.OpenOptions) (*vfs.FileDescription, error) {
-	t, err := mi.root.allocateTerminal(rp.Credentials())
+	t, err := mi.root.allocateTerminal(rp.Credentials(), rp.Mount().Filesystem())
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +103,7 @@ var _ vfs.FileDescriptionImpl = (*masterFileDescription)(nil)
 
 // Release implements vfs.FileDescriptionImpl.Release.
 func (mfd *masterFileDescription) Release(ctx context.Context) {
-	mfd.inode.root.masterClose(mfd.t)
+	mfd.inode.root.masterClose(ctx, mfd.t)
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.

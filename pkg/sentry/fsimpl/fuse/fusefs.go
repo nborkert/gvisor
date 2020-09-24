@@ -249,6 +249,7 @@ func (fs *filesystem) Release(ctx context.Context) {
 // +stateify savable
 type inode struct {
 	inodeRefs
+	kernfs.AlwaysValid
 	kernfs.InodeAttrs
 	kernfs.InodeDirectoryNoNewChildren
 	kernfs.InodeNoDynamicLookup
@@ -288,7 +289,7 @@ func (fs *filesystem) newRootInode(creds *auth.Credentials, mode linux.FileMode)
 	i.InodeAttrs.Init(creds, linux.UNNAMED_MAJOR, fs.devMinor, 1, linux.ModeDirectory|0755)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.EnableLeakCheck()
-	i.dentry.Init(i)
+	i.dentry.Init(i, fs.VFSFilesystem())
 	i.nodeID = 1
 
 	return &i.dentry
@@ -301,7 +302,7 @@ func (fs *filesystem) newInode(nodeID uint64, attr linux.FUSEAttr) *kernfs.Dentr
 	atomic.StoreUint64(&i.size, attr.Size)
 	i.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	i.EnableLeakCheck()
-	i.dentry.Init(i)
+	i.dentry.Init(i, fs.VFSFilesystem())
 
 	return &i.dentry
 }
@@ -420,11 +421,6 @@ func (*inode) IterDirents(ctx context.Context, callback vfs.IterDirentsCallback,
 	return offset, nil
 }
 
-// Valid implements kernfs.Inode.Valid.
-func (*inode) Valid(ctx context.Context) bool {
-	return true
-}
-
 // NewFile implements kernfs.Inode.NewFile.
 func (i *inode) NewFile(ctx context.Context, name string, opts vfs.OpenOptions) (*kernfs.Dentry, error) {
 	kernelTask := kernel.TaskFromContext(ctx)
@@ -485,7 +481,7 @@ func (i *inode) Unlink(ctx context.Context, name string, child *kernfs.Dentry) e
 	if err := res.Error(); err != nil {
 		return err
 	}
-	return i.dentry.RemoveChildLocked(name, child)
+	return i.dentry.RemoveChildLocked(ctx, name, child)
 }
 
 // NewDir implements kernfs.Inode.NewDir.
@@ -519,7 +515,7 @@ func (i *inode) RmDir(ctx context.Context, name string, child *kernfs.Dentry) er
 		return err
 	}
 
-	return i.dentry.RemoveChildLocked(name, child)
+	return i.dentry.RemoveChildLocked(ctx, name, child)
 }
 
 // newEntry calls FUSE server for entry creation and allocates corresponding entry according to response.

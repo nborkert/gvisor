@@ -63,7 +63,7 @@ func (fs *filesystem) newSubtasks(task *kernel.Task, pidns *kernel.PIDNamespace,
 
 	inode := &taskOwnedInode{Inode: subInode, owner: task}
 	dentry := &kernfs.Dentry{}
-	dentry.Init(inode)
+	dentry.Init(inode, fs.VFSFilesystem())
 
 	return dentry
 }
@@ -82,7 +82,7 @@ func (i *subtasksInode) Lookup(ctx context.Context, name string) (*kernfs.Dentry
 	if subTask.ThreadGroup() != i.task.ThreadGroup() {
 		return nil, syserror.ENOENT
 	}
-	return i.fs.newTaskInode(subTask, i.pidns, false, i.cgroupControllers), nil
+	return i.fs.newTaskInode(subTask, i.pidns, false, i.cgroupControllers)
 }
 
 // IterDirents implements kernfs.inodeDynamicLookup.IterDirents.

@@ -47,8 +47,11 @@ type taskInode struct {
 
 var _ kernfs.Inode = (*taskInode)(nil)
 
-func (fs *filesystem) newTaskInode(task *kernel.Task, pidns *kernel.PIDNamespace, isThreadGroup bool, cgroupControllers map[string]string) *kernfs.Dentry {
-	// TODO(gvisor.dev/issue/164): Fail with ESRCH if task exited.
+func (fs *filesystem) newTaskInode(task *kernel.Task, pidns *kernel.PIDNamespace, isThreadGroup bool, cgroupControllers map[string]string) (*kernfs.Dentry, error) {
+	if task.ExitState() == kernel.TaskExitDead {
+		return nil, syserror.ESRCH
+	}
+
 	contents := map[string]*kernfs.Dentry{
 		"auxv":      fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &auxvData{task: task}),
 		"cmdline":   fs.newTaskOwnedFile(task, fs.NextIno(), 0444, &cmdlineData{task: task, arg: cmdlineDataArg}),
@@ -90,13 +93,13 @@ func (fs *filesystem) newTaskInode(task *kernel.Task, pidns *kernel.PIDNamespace
 
 	inode := &taskOwnedInode{Inode: taskInode, owner: task}
 	dentry := &kernfs.Dentry{}
-	dentry.Init(inode)
+	dentry.Init(inode, fs.VFSFilesystem())
 
 	taskInode.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	links := taskInode.OrderedChildren.Populate(dentry, contents)
 	taskInode.IncLinks(links)
 
-	return dentry
+	return dentry, nil
 }
 
 // Valid implements kernfs.inodeDynamicLookup. This inode remains valid as long
@@ -104,6 +107,11 @@ func (fs *filesystem) newTaskInode(task *kernel.Task, pidns *kernel.PIDNamespace
 // PID could replace it.
 func (i *taskInode) Valid(ctx context.Context) bool {
 	return i.task.ExitState() != kernel.TaskExitDead
+}
+
+// Keep implements kernfs.inodeDynamicLookup.Keep.
+func (*taskInode) Keep() bool {
+	return false
 }
 
 // Open implements kernfs.Inode.Open.
@@ -146,7 +154,7 @@ func (fs *filesystem) newTaskOwnedFile(task *kernel.Task, ino uint64, perm linux
 
 	taskInode := &taskOwnedInode{Inode: inode, owner: task}
 	d := &kernfs.Dentry{}
-	d.Init(taskInode)
+	d.Init(taskInode, fs.VFSFilesystem())
 	return d
 }
 
@@ -161,7 +169,7 @@ func (fs *filesystem) newTaskOwnedDir(task *kernel.Task, ino uint64, perm linux.
 
 	inode := &taskOwnedInode{Inode: dir, owner: task}
 	d := &kernfs.Dentry{}
-	d.Init(inode)
+	d.Init(inode, fs.VFSFilesystem())
 
 	dir.OrderedChildren.Init(kernfs.OrderedChildrenOptions{})
 	links := dir.OrderedChildren.Populate(d, children)
