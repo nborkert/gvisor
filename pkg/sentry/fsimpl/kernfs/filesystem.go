@@ -355,7 +355,7 @@ func (fs *Filesystem) MkdirAt(ctx context.Context, rp *vfs.ResolvingPath, opts v
 		if !opts.ForSyntheticMountpoint || err == syserror.EEXIST {
 			return err
 		}
-		child = newSyntheticDirectory(rp.Credentials(), opts.Mode)
+		child = newSyntheticDirectory(rp.Credentials(), fs.VFSFilesystem(), opts.Mode)
 	}
 	parent.InsertChild(pc, child)
 	return nil
