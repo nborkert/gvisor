@@ -207,6 +207,9 @@ func TestFragmentation(t *testing.T) {
 			if got, want := len(ep.WrittenPackets), int(r.Stats().IP.PacketsSent.Value()); got != want {
 				t.Errorf("no errors yet got len(ep.WrittenPackets) = %d, want = %d", got, want)
 			}
+			if got := r.Stats().IP.OutgoingPacketErrors.Value(); got != 0 {
+				t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = 0", got)
+			}
 			compareFragments(t, ep.WrittenPackets, source, ft.mtu)
 		})
 	}
@@ -215,6 +218,9 @@ func TestFragmentation(t *testing.T) {
 // TestFragmentationErrors checks that errors are returned from write packet
 // correctly.
 func TestFragmentationErrors(t *testing.T) {
+	// When using WritePacket, the maximum number of error is 1.
+	const errorCount = 1
+
 	fragTests := []struct {
 		description           string
 		mtu                   uint32
@@ -244,6 +250,9 @@ func TestFragmentationErrors(t *testing.T) {
 			}
 			if got, want := len(ep.WrittenPackets), int(r.Stats().IP.PacketsSent.Value()); err != nil && got != want {
 				t.Errorf("got len(ep.WrittenPackets) = %d, want = %d", got, want)
+			}
+			if got := r.Stats().IP.OutgoingPacketErrors.Value(); got != errorCount {
+				t.Errorf("got r.Stats().IP.OutgoingPacketErrors.Value() = %d, want = %d", got, errorCount)
 			}
 		})
 	}
