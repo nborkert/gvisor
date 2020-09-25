@@ -12,18 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package ipv4 contains the implementation of the ipv4 network protocol. To use
-// it in the networking stack, this package must be added to the project, and
-// activated on the stack by passing ipv4.NewProtocol() as one of the network
-// protocols when calling stack.New(). Then endpoints can be created by passing
-// ipv4.ProtocolNumber as the network protocol number when calling
-// Stack.NewEndpoint().
+// Package ipv4 contains the implementation of the ipv4 network protocol.
 package ipv4
 
 import (
 	"fmt"
 	"sync/atomic"
 
+	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
@@ -52,22 +48,115 @@ const (
 	fragmentblockSize = 8
 )
 
+var ipv4BroadcastAddr = header.IPv4Broadcast.WithPrefix()
+
+var _ stack.GroupAddressableEndpoint = (*endpoint)(nil)
+var _ stack.AddressableEndpoint = (*endpoint)(nil)
+var _ stack.NetworkEndpoint = (*endpoint)(nil)
+
 type endpoint struct {
-	nicID      tcpip.NICID
+	nic        stack.NetworkInterface
 	linkEP     stack.LinkEndpoint
 	dispatcher stack.TransportDispatcher
 	protocol   *protocol
-	stack      *stack.Stack
+
+	// enabled is set to 1 when the enpoint is enabled and 0 when it is
+	// disabled.
+	//
+	// Must be accessed using atomic operations.
+	enabled uint32
+
+	mu struct {
+		sync.RWMutex
+
+		addressableEndpointState stack.AddressableEndpointState
+	}
 }
 
 // NewEndpoint creates a new ipv4 endpoint.
-func (p *protocol) NewEndpoint(nicID tcpip.NICID, _ stack.LinkAddressCache, _ stack.NUDHandler, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint, st *stack.Stack) stack.NetworkEndpoint {
-	return &endpoint{
-		nicID:      nicID,
-		linkEP:     linkEP,
+func (p *protocol) NewEndpoint(nic stack.NetworkInterface, _ stack.LinkAddressCache, _ stack.NUDHandler, dispatcher stack.TransportDispatcher) stack.NetworkEndpoint {
+	e := &endpoint{
+		nic:        nic,
+		linkEP:     nic.LinkEndpoint(),
 		dispatcher: dispatcher,
 		protocol:   p,
-		stack:      st,
+	}
+	e.mu.addressableEndpointState.Init(e)
+	return e
+}
+
+// Enable implements stack.NetworkEndpoint.
+func (e *endpoint) Enable() *tcpip.Error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	// If the NIC is not enabled, the endpoint can't do anything meaningful so
+	// don't enable the endpoint.
+	if !e.nic.Enabled() {
+		return tcpip.ErrNotPermitted
+	}
+
+	// If the endpoint is already enabled, there is nothing for it to do.
+	if !e.setEnabled(true) {
+		return nil
+	}
+
+	// Create an endpoint to receive broadcast packets on this interface.
+	ep, err := e.mu.addressableEndpointState.AddAndAcquirePermanentAddress(ipv4BroadcastAddr, stack.NeverPrimaryEndpoint, stack.AddressConfigStatic, false /* deprecated */)
+	if err != nil {
+		return err
+	}
+	// We have no need for the address endpoint.
+	ep.DecRef()
+
+	// As per RFC 1122 section 3.3.7, all hosts should join the all-hosts
+	// multicast group. Note, the IANA calls the all-hosts multicast group the
+	// all-systems multicast group.
+	_, err = e.mu.addressableEndpointState.JoinGroup(header.IPv4AllSystems)
+	return err
+}
+
+// Enabled implements stack.NetworkEndpoint.
+func (e *endpoint) Enabled() bool {
+	return e.nic.Enabled() && e.isEnabled()
+}
+
+// isEnabled returns true if the endpoint is enabled, regardless of the
+// enabled status of the NIC.
+func (e *endpoint) isEnabled() bool {
+	return atomic.LoadUint32(&e.enabled) == 1
+}
+
+// setEnabled sets the enabled status for the endpoint.
+//
+// Returns true if the enabled status was updated.
+func (e *endpoint) setEnabled(v bool) bool {
+	if v {
+		return atomic.SwapUint32(&e.enabled, 1) == 0
+	}
+	return atomic.SwapUint32(&e.enabled, 0) == 1
+}
+
+// Disable implements stack.NetworkEndpoint.
+func (e *endpoint) Disable() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.disableLocked()
+}
+
+func (e *endpoint) disableLocked() {
+	if !e.setEnabled(false) {
+		return
+	}
+
+	// The endpoint may have already left the multicast group.
+	if _, err := e.mu.addressableEndpointState.LeaveGroup(header.IPv4AllSystems); err != nil && err != tcpip.ErrBadLocalAddress {
+		panic(fmt.Sprintf("unexpected error when leaving group = %s: %s", header.IPv4AllSystems, err))
+	}
+
+	// The address may have already been removed.
+	if err := e.mu.addressableEndpointState.RemovePermanentAddress(ipv4BroadcastAddr.Address); err != nil && err != tcpip.ErrBadLocalAddress {
+		panic(fmt.Sprintf("unexpected error when removing address = %s: %s", ipv4BroadcastAddr.Address, err))
 	}
 }
 
@@ -80,16 +169,6 @@ func (e *endpoint) DefaultTTL() uint8 {
 // the network layer max header length.
 func (e *endpoint) MTU() uint32 {
 	return calculateMTU(e.linkEP.MTU())
-}
-
-// Capabilities implements stack.NetworkEndpoint.Capabilities.
-func (e *endpoint) Capabilities() stack.LinkEndpointCapabilities {
-	return e.linkEP.Capabilities()
-}
-
-// NICID returns the ID of the NIC this endpoint belongs to.
-func (e *endpoint) NICID() tcpip.NICID {
-	return e.nicID
 }
 
 // MaxHeaderLength returns the maximum length needed by ipv4 headers (and
@@ -233,8 +312,8 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 
 	// iptables filtering. All packets that reach here are locally
 	// generated.
-	nicName := e.stack.FindNICNameFromID(e.NICID())
-	ipt := e.stack.IPTables()
+	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
+	ipt := e.protocol.stack.IPTables()
 	if ok := ipt.Check(stack.Output, pkt, gso, r, "", nicName); !ok {
 		// iptables is telling us to drop the packet.
 		r.Stats().IP.IPTablesOutputDropped.Increment()
@@ -250,7 +329,7 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 	// short circuits broadcasts before they are sent out to other hosts.
 	if pkt.NatDone {
 		netHeader := header.IPv4(pkt.NetworkHeader().View())
-		ep, err := e.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress())
+		ep, err := e.protocol.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress())
 		if err == nil {
 			route := r.ReverseRoute(netHeader.SourceAddress(), netHeader.DestinationAddress())
 			ep.HandlePacket(&route, pkt)
@@ -290,10 +369,10 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		pkt = pkt.Next()
 	}
 
-	nicName := e.stack.FindNICNameFromID(e.NICID())
+	nicName := e.protocol.stack.FindNICNameFromID(e.nic.ID())
 	// iptables filtering. All packets that reach here are locally
 	// generated.
-	ipt := e.stack.IPTables()
+	ipt := e.protocol.stack.IPTables()
 	dropped, natPkts := ipt.CheckPackets(stack.Output, pkts, gso, r, nicName)
 	if len(dropped) == 0 && len(natPkts) == 0 {
 		// Fast path: If no packets are to be dropped then we can just invoke the
@@ -313,7 +392,7 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.Packe
 		}
 		if _, ok := natPkts[pkt]; ok {
 			netHeader := header.IPv4(pkt.NetworkHeader().View())
-			if ep, err := e.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress()); err == nil {
+			if ep, err := e.protocol.stack.FindNetworkEndpoint(header.IPv4ProtocolNumber, netHeader.DestinationAddress()); err == nil {
 				src := netHeader.SourceAddress()
 				dst := netHeader.DestinationAddress()
 				route := r.ReverseRoute(src, dst)
@@ -390,6 +469,10 @@ func (e *endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBu
 // HandlePacket is called by the link layer when new ipv4 packets arrive for
 // this endpoint.
 func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+	if !e.isEnabled() {
+		return
+	}
+
 	h := header.IPv4(pkt.NetworkHeader().View())
 	if !h.IsValid(pkt.Data.Size() + pkt.NetworkHeader().View().Size() + pkt.TransportHeader().View().Size()) {
 		r.Stats().IP.MalformedPacketsReceived.Increment()
@@ -398,7 +481,7 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 
 	// iptables filtering. All packets that reach here are intended for
 	// this machine and will not be forwarded.
-	ipt := e.stack.IPTables()
+	ipt := e.protocol.stack.IPTables()
 	if ok := ipt.Check(stack.Input, pkt, nil, nil, "", ""); !ok {
 		// iptables is telling us to drop the packet.
 		r.Stats().IP.IPTablesInputDropped.Increment()
@@ -480,16 +563,124 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
 }
 
 // Close cleans up resources associated with the endpoint.
-func (e *endpoint) Close() {}
+func (e *endpoint) Close() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	e.disableLocked()
+	e.mu.addressableEndpointState.Cleanup()
+}
+
+// AddAndAcquirePermanentAddress implements stack.AddressableEndpoint.
+func (e *endpoint) AddAndAcquirePermanentAddress(addr tcpip.AddressWithPrefix, peb stack.PrimaryEndpointBehavior, configType stack.AddressConfigType, deprecated bool) (stack.AddressEndpoint, *tcpip.Error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.mu.addressableEndpointState.AddAndAcquirePermanentAddress(addr, peb, configType, deprecated)
+}
+
+// RemovePermanentAddress implements stack.AddressableEndpoint.
+func (e *endpoint) RemovePermanentAddress(addr tcpip.Address) *tcpip.Error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.mu.addressableEndpointState.RemovePermanentAddress(addr)
+}
+
+// AcquireAssignedAddress implements stack.AddressableEndpoint.
+func (e *endpoint) AcquireAssignedAddress(localAddr tcpip.Address, allowTemp bool, tempPEB stack.PrimaryEndpointBehavior) stack.AddressEndpoint {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	loopback := e.nic.IsLoopback()
+	addressEndpoint := e.mu.addressableEndpointState.ReadOnly().AddrOrMatching(localAddr, allowTemp, func(addressEndpoint stack.AddressEndpoint) bool {
+		subnet := addressEndpoint.AddressWithPrefix().Subnet()
+		// IPv4 has a notion of a subnet broadcast address and considers the
+		// loopback interface bound to an address's whole subnet (on linux).
+		return subnet.IsBroadcast(localAddr) || (loopback && subnet.Contains(localAddr))
+	})
+	if addressEndpoint != nil {
+		return addressEndpoint
+	}
+
+	if !allowTemp {
+		return nil
+	}
+
+	addr := localAddr.WithPrefix()
+	addressEndpoint, err := e.mu.addressableEndpointState.AddAndAcquireTemporaryAddress(addr, tempPEB)
+	if err != nil {
+		// AddAddress only returns an error if the address is already assigned,
+		// but we just checked above if the address exists so we expect no error.
+		panic(fmt.Sprintf("e.mu.addressableEndpointState.AddAndAcquireTemporaryAddress(%s, %d): %s", addr, tempPEB, err))
+	}
+	return addressEndpoint
+}
+
+// AcquirePrimaryAddress implements stack.AddressableEndpoint.
+func (e *endpoint) AcquirePrimaryAddress(remoteAddr tcpip.Address, allowExpired bool) stack.AddressEndpoint {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.mu.addressableEndpointState.AcquirePrimaryAddress(remoteAddr, allowExpired)
+}
+
+// PrimaryAddresses implements stack.AddressableEndpoint.
+func (e *endpoint) PrimaryAddresses() []tcpip.AddressWithPrefix {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.mu.addressableEndpointState.PrimaryAddresses()
+}
+
+// PermanentAddresses implements stack.AddressableEndpoint.
+func (e *endpoint) PermanentAddresses() []tcpip.AddressWithPrefix {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.mu.addressableEndpointState.PermanentAddresses()
+}
+
+// JoinGroup implements stack.GroupAddressableEndpoint.
+func (e *endpoint) JoinGroup(addr tcpip.Address) (bool, *tcpip.Error) {
+	if !header.IsV4MulticastAddress(addr) {
+		return false, tcpip.ErrBadAddress
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.mu.addressableEndpointState.JoinGroup(addr)
+}
+
+// LeaveGroup implements stack.GroupAddressableEndpoint.
+func (e *endpoint) LeaveGroup(addr tcpip.Address) (bool, *tcpip.Error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.mu.addressableEndpointState.LeaveGroup(addr)
+}
+
+// IsInGroup implements stack.GroupAddressableEndpoint.
+func (e *endpoint) IsInGroup(addr tcpip.Address) bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.mu.addressableEndpointState.IsInGroup(addr)
+}
+
+var _ stack.ForwardingNetworkProtocol = (*protocol)(nil)
+var _ stack.NetworkProtocol = (*protocol)(nil)
 
 type protocol struct {
-	ids    []uint32
-	hashIV uint32
+	stack *stack.Stack
 
 	// defaultTTL is the current default TTL for the protocol. Only the
-	// uint8 portion of it is meaningful and it must be accessed
-	// atomically.
+	// uint8 portion of it is meaningful.
+	//
+	// Must be accessed using atomic operations.
 	defaultTTL uint32
+
+	// forwarding is set to 1 when the protocol has forwarding enabled and 0
+	// when it is disabled.
+	//
+	// Must be accessed using atomic operations.
+	forwarding uint32
+
+	ids    []uint32
+	hashIV uint32
 
 	fragmentation *fragmentation.Fragmentation
 }
@@ -563,6 +754,20 @@ func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNu
 	return ipHdr.TransportProtocol(), !ipHdr.More() && ipHdr.FragmentOffset() == 0, true
 }
 
+// Forwarding implements stack.ForwardingNetworkProtocol.
+func (p *protocol) Forwarding() bool {
+	return uint8(atomic.LoadUint32(&p.forwarding)) == 1
+}
+
+// SetForwarding implements stack.ForwardingNetworkProtocol.
+func (p *protocol) SetForwarding(v bool) {
+	if v {
+		atomic.StoreUint32(&p.forwarding, 1)
+	} else {
+		atomic.StoreUint32(&p.forwarding, 0)
+	}
+}
+
 // calculateMTU calculates the network-layer payload MTU based on the link-layer
 // payload mtu.
 func calculateMTU(mtu uint32) uint32 {
@@ -584,7 +789,7 @@ func hashRoute(r *stack.Route, protocol tcpip.TransportProtocolNumber, hashIV ui
 }
 
 // NewProtocol returns an IPv4 network protocol.
-func NewProtocol() stack.NetworkProtocol {
+func NewProtocol(s *stack.Stack) stack.NetworkProtocol {
 	ids := make([]uint32, buckets)
 
 	// Randomly initialize hashIV and the ids.
@@ -595,6 +800,7 @@ func NewProtocol() stack.NetworkProtocol {
 	hashIV := r[buckets]
 
 	return &protocol{
+		stack:         s,
 		ids:           ids,
 		hashIV:        hashIV,
 		defaultTTL:    DefaultTTL,
