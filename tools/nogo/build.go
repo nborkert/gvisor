@@ -26,6 +26,9 @@ var (
 	// and should not have any special prefix applied.
 	internalPrefix = fmt.Sprintf("^")
 
+	// generatedPrefix is a regex for generated files.
+	generatedPrefix = "^(.*/)?(bazel-genfiles|bazel-out|bazel-bin)/"
+
 	// externalPrefix is external workspace packages.
 	externalPrefix = "^external/"
 )

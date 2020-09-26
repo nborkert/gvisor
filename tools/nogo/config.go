@@ -41,6 +41,8 @@ import (
 	"golang.org/x/tools/go/analysis/passes/unreachable"
 	"golang.org/x/tools/go/analysis/passes/unsafeptr"
 	"golang.org/x/tools/go/analysis/passes/unusedresult"
+	"honnef.co/go/tools/staticcheck"
+	"honnef.co/go/tools/stylecheck"
 
 	"gvisor.dev/gvisor/tools/checkescape"
 	"gvisor.dev/gvisor/tools/checkunsafe"
@@ -121,6 +123,33 @@ var analyzerConfig = map[*analysis.Analyzer]matcher{
 	// Internal analyzers: external packages not subject.
 	checkescape.Analyzer: internalMatches(),
 	checkunsafe.Analyzer: internalMatches(),
+}
+
+func init() {
+	staticMatcher := and(
+		// Only match internal, non-generated files.
+		internalMatches(),
+		generatedExcluded(),
+
+		// We use ALL_CAPS for system definitions,
+		// which are common enough in the code base
+		// that we shouldn't annotate exceptions.
+		//
+		// Same story for underscores.
+		resultExcluded([]string{
+			"should not use ALL_CAPS in Go names",
+			"should not use underscores in Go names",
+		}),
+	)
+
+	// Add all staticcheck analyzers; internal only.
+	for _, a := range staticcheck.Analyzers {
+		analyzerConfig[a] = staticMatcher
+	}
+	// Add all stylecheck analyzers; internal only.
+	for _, a := range stylecheck.Analyzers {
+		analyzerConfig[a] = staticMatcher
+	}
 }
 
 var escapesConfig = map[*analysis.Analyzer]matcher{

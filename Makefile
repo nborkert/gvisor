@@ -379,3 +379,7 @@ configure: ## Configures a single runtime. Requires sudo. Typically called from 
 test-runtime: ## A convenient wrapper around test that provides the runtime argument. Target must still be provided.
 	@$(call submake,test OPTIONS="$(OPTIONS) --test_arg=--runtime=$(RUNTIME)")
 .PHONY: test-runtime
+
+gazelle: ## Runs gazelle to update WORKSPACE.
+	@$(call submake,run TARGETS="//:gazelle" ARGS="update-repos -from_file=go.mod -prune")
+.PHONY: gazelle
